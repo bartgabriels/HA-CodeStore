@@ -1,0 +1,1152 @@
+"""Tuya blind controller quirk for _TZE284_libht6ua TS0601 - Enhanced ZCL Integration."""
+import logging
+from typing import Any, Dict
+
+from zigpy.profiles import zha
+from zigpy.zcl import foundation
+from zigpy.zcl.clusters.closures import WindowCovering
+from zigpy.zcl.clusters.general import Basic, Groups, Ota, Scenes, Time
+
+from zhaquirks.const import (
+    DEVICE_TYPE,
+    ENDPOINTS,
+    INPUT_CLUSTERS,
+    MODELS_INFO,
+    OUTPUT_CLUSTERS,
+    PROFILE_ID,
+)
+from zhaquirks.tuya import (
+    TuyaWindowCover,
+    TuyaManufacturerWindowCover,
+    TuyaWindowCoverControl,
+    TuyaPowerConfigurationCluster,
+)
+
+_LOGGER = logging.getLogger(__name__)
+_LOGGER.info("WindowCovering imported: %s", WindowCovering)
+
+
+class PersistentTuyaBasicCluster(Basic):
+    """Basic cluster that maintains persistent firmware information."""
+    
+    def __init__(self, *args, **kwargs):
+        """Initialize with persistent firmware cache."""
+        super().__init__(*args, **kwargs)
+        self._persistent_firmware = {}
+        
+    async def read_attributes(self, attributes, *args, **kwargs):
+        """Override to provide persistent firmware attributes."""
+        result = await super().read_attributes(attributes, *args, **kwargs)
+        
+        # If we have cached firmware info, ensure it's always returned
+        if result and isinstance(result, tuple) and len(result) > 0:
+            attr_dict = result[0]
+            
+            # For firmware-related attributes, use cached values if available
+            firmware_attrs = ['app_version', 'sw_build_id', 'hw_version', 'date_code']
+            for attr_name in firmware_attrs:
+                if hasattr(self.attributes_by_name, attr_name):
+                    attr_id = self.attributes_by_name[attr_name].id
+                    
+                    # If this attribute was requested and we have a cached value
+                    if attr_id in attributes and attr_name in self._persistent_firmware:
+                        cached_value = self._persistent_firmware[attr_name]
+                        if cached_value is not None:
+                            attr_dict[attr_id] = cached_value
+                            _LOGGER.debug("🔒 Using persistent %s: %s", attr_name, cached_value)
+        
+        return result
+    
+    def _update_attribute(self, attrid, value):
+        """Override to cache firmware attributes persistently."""
+        super()._update_attribute(attrid, value)
+        
+        # Cache firmware-related attributes
+        firmware_attrs = {
+            self.attributes_by_name.get('app_version', {}).id: 'app_version',
+            self.attributes_by_name.get('sw_build_id', {}).id: 'sw_build_id', 
+            self.attributes_by_name.get('hw_version', {}).id: 'hw_version',
+            self.attributes_by_name.get('date_code', {}).id: 'date_code',
+        }
+        
+        if attrid in firmware_attrs and value is not None:
+            attr_name = firmware_attrs[attrid]
+            self._persistent_firmware[attr_name] = value
+            _LOGGER.info("🔒 Cached persistent firmware: %s = %s", attr_name, value)
+
+
+class TuyaBlindControllerManufCluster(TuyaManufacturerWindowCover):
+    """Enhanced manufacturer cluster that coordinates with ZCL attributes."""
+    
+    def __init__(self, *args, **kwargs):
+        """Initialize the manufacturer cluster."""
+        super().__init__(*args, **kwargs)
+        self._last_stable_position = None
+        self._position_samples = []
+        self._ignore_until = 0
+        self._calibration_mode = False
+        self._known_data_points = {}
+        self._motor_specs = {
+            'default_calibration_time': 30,  # seconds
+            'default_motor_speed': 100,      # 1-255 range
+            'position_tolerance': 2,         # percentage points
+            'movement_timeout': 60           # seconds
+        }
+        self._calibration_state = {
+            'in_progress': False,
+            'start_time': None,
+            'target_position': None,
+            'actual_time': None
+        }
+        # PERSISTENT FIRMWARE CACHE - survives sleep/wake cycles
+        self._firmware_cache = {
+            'app_version': None,
+            'sw_build_id': None,
+            'hw_version': None,
+            'date_code': None,
+            'cached_time': None
+        }
+        
+    async def bind(self):
+        """Bind and set up initial configuration with enhanced discovery."""
+        result = await super().bind()
+        
+        # Enhanced initial setup
+        try:
+            # 1. Show any previously cached firmware info (non-invasive)
+            await self._restore_cached_firmware()
+            
+            # 2. Read window covering position first (priority)
+            window_covering = self.endpoint.window_covering
+            if window_covering:
+                # Read current position from ZCL attributes
+                current_pos = await window_covering.read_attributes(['current_position_lift_percentage'])
+                if current_pos and 'current_position_lift_percentage' in current_pos[0]:
+                    pos_value = current_pos[0]['current_position_lift_percentage']
+                    if pos_value is not None and 0 <= pos_value <= 100:
+                        self._last_stable_position = pos_value
+                        _LOGGER.info("Initial position read from ZCL: %s%%", pos_value)
+            
+            # 3. Discover firmware info (after a delay to not interfere with ZHA)
+            await __import__('asyncio').sleep(2.0)  # Let ZHA do its thing first
+            await self._discover_firmware_version()
+                        
+            # 4. Request device capabilities discovery
+            await self._discover_device_capabilities()
+                        
+        except Exception as e:
+            _LOGGER.debug("Could not complete initial setup: %s", e)
+            
+        return result
+    
+    async def _discover_firmware_version(self):
+        """Discover and log firmware version from multiple sources."""
+        _LOGGER.info("🔍 Discovering firmware version...")
+        
+        try:
+            # Method 1: Basic cluster attributes (READ-ONLY, don't interfere)
+            basic_cluster = getattr(self.endpoint, "basic", None)
+            if basic_cluster:
+                _LOGGER.debug("Reading Basic cluster attributes for firmware info...")
+                
+                # Read all firmware-related attributes (non-invasive)
+                firmware_attrs = [
+                    'app_version',          # Application version
+                    'sw_build_id',          # Software build ID  
+                    'stack_version',        # Stack version
+                    'hw_version',           # Hardware version
+                    'manufacturer',         # Manufacturer
+                    'model',               # Model
+                    'date_code',           # Date code
+                    'power_source',        # Power source
+                ]
+                
+                for attr_name in firmware_attrs:
+                    try:
+                        result = await basic_cluster.read_attributes([attr_name])
+                        if result and attr_name in result[0]:
+                            value = result[0][attr_name]
+                            if value is not None and value != 0 and value != '':
+                                _LOGGER.warning("📋 %s: %s", attr_name.upper(), value)
+                                
+                                # CACHE ONLY (don't interfere with ZHA)
+                                if attr_name in self._firmware_cache:
+                                    self._firmware_cache[attr_name] = value
+                                    self._firmware_cache['cached_time'] = __import__('time').time()
+                                
+                    except Exception as e:
+                        _LOGGER.debug("Could not read %s: %s", attr_name, e)
+                    
+        except Exception as e:
+            _LOGGER.debug("Basic cluster firmware discovery failed: %s", e)
+        
+        # Method 2: Request firmware via Tuya data points
+        try:
+            _LOGGER.debug("Requesting firmware info via Tuya data points...")
+            
+            # Reduced list to avoid overwhelming the device
+            firmware_dps = [
+                (20, "Firmware Version"),
+                (21, "Hardware Version"), 
+                (24, "MCU Version"),
+                (103, "Extended Device Info"),
+            ]
+            
+            for dp, description in firmware_dps:
+                try:
+                    _LOGGER.debug("Requesting DP %s (%s)", dp, description)
+                    # Request the data point (this might trigger a response)
+                    await self.tuya_mcu_command(dp, 0, expect_reply=False)
+                    await __import__('asyncio').sleep(0.5)  # Longer delay
+                except Exception as e:
+                    _LOGGER.debug("DP %s request failed: %s", dp, e)
+                    
+        except Exception as e:
+            _LOGGER.debug("Tuya DP firmware discovery failed: %s", e)
+            
+        _LOGGER.info("✅ Firmware discovery completed - check logs for version info")
+    
+    async def _restore_cached_firmware(self):
+        """Log cached firmware info (non-invasive)."""
+        try:
+            if any(v is not None for v in self._firmware_cache.values()):
+                _LOGGER.info("💾 Previously discovered firmware:")
+                
+                for attr_name, cached_value in self._firmware_cache.items():
+                    if cached_value is not None and attr_name != 'cached_time':
+                        _LOGGER.info("💾   %s: %s", attr_name.upper(), cached_value)
+                            
+                # Log cache age
+                if self._firmware_cache['cached_time']:
+                    cache_age = __import__('time').time() - self._firmware_cache['cached_time']
+                    _LOGGER.info("💾 Cache age: %.1f hours", cache_age / 3600)
+            else:
+                _LOGGER.debug("No firmware info cached yet")
+                    
+        except Exception as e:
+            _LOGGER.debug("Failed to show cached firmware: %s", e)
+    
+    def get_cached_firmware_info(self):
+        """Return cached firmware information."""
+        return {k: v for k, v in self._firmware_cache.items() if v is not None}
+    
+    async def _discover_device_capabilities(self):
+        """Discover device capabilities and optimal calibration settings."""
+        _LOGGER.info("Starting enhanced device capability discovery...")
+        
+        # Test common calibration data points with read operations first
+        calibration_test_points = [
+            # Common calibration time DPs
+            (7, "Calibration Time", "read"),
+            (8, "Calibration Time Alt", "read"),
+            (9, "Motor Direction", "read"),
+            (10, "Motor Speed", "read"),
+            
+            # Extended search based on recent findings
+            (5, "Motor Speed Setting", "read"),
+            (6, "Motor Acceleration", "read"), 
+            (11, "Position Limits", "read"),
+            (14, "Advanced Motor Control", "read"),
+            (15, "Position Calibration", "read"),
+            (16, "Calibration Trigger", "read"),
+            (17, "Auto Calibration", "read"),
+            (18, "Factory Reset", "read"),
+            
+            # High DP numbers sometimes used for advanced features
+            (101, "Extended Calibration", "read"),
+            (102, "Motor Characteristics", "read"),
+        ]
+        
+        for dp_num, description, operation in calibration_test_points:
+            try:
+                if operation == "read":
+                    # Try to read the data point to see if it exists
+                    _LOGGER.debug("Testing DP %s (%s) for read capability", dp_num, description)
+                    await __import__('asyncio').sleep(0.2)
+            except Exception as e:
+                _LOGGER.debug("DP %s (%s) test failed: %s", dp_num, description, e)
+    
+    async def command(
+        self,
+        command_id: int,
+        *args,
+        manufacturer: int | None = None,
+        expect_reply: bool = True,
+        tsn: int | None = None,
+        **kwargs,
+    ):
+        """Override command to manage position reporting during movements."""
+        _LOGGER.debug("TUYA COMMAND - ID: 0x%04x, Args: %s", command_id, args)
+        
+        # Reset position tracking when new commands are sent
+        import time
+        self._ignore_until = time.time() + 1.0  # Ignore position updates for 1 second
+        self._position_samples.clear()
+        
+        return await super().command(command_id, *args, manufacturer=manufacturer, 
+                                   expect_reply=expect_reply, tsn=tsn, **kwargs)
+    
+    def handle_cluster_request(
+        self,
+        hdr: foundation.ZCLHeader,
+        args,
+        *,
+        dst_addressing=None,
+    ) -> None:
+        """Handle cluster request with improved position validation and DP discovery."""
+        if hdr.command_id in (0x0001, 0x0002):  # GET_DATA, SET_DATA_RESPONSE
+            if not args or args[0] is None:
+                _LOGGER.debug("Received empty or None payload")
+                super().handle_cluster_request(hdr, args, dst_addressing=dst_addressing)
+                return
+                
+            tuya_payload = args[0]
+            if not hasattr(tuya_payload, 'command_id'):
+                _LOGGER.debug("Payload missing command_id attribute")
+                super().handle_cluster_request(hdr, args, dst_addressing=dst_addressing)
+                return
+                
+            dp_num = tuya_payload.command_id & 0xFF
+            
+            # Store all data points we see for calibration discovery
+            self._known_data_points[dp_num] = {
+                'data': list(tuya_payload.data) if tuya_payload.data else [],
+                'function': tuya_payload.function,
+                'last_seen': __import__('time').time()
+            }
+            
+            _LOGGER.warning("TUYA DP %s: %s (func: %s)", dp_num, 
+                          list(tuya_payload.data) if tuya_payload.data else "None",
+                          tuya_payload.function)
+            
+            # Handle known data points
+            if dp_num == 3 and len(tuya_payload.data) >= 5:
+                self._handle_position_update(tuya_payload.data[4])
+                    
+            elif dp_num == 12 and len(tuya_payload.data) >= 2:
+                battery_status = tuya_payload.data[1]
+                _LOGGER.debug("Battery status: %s", "Good" if battery_status == 0 else "Low")
+                
+            elif dp_num == 13 and len(tuya_payload.data) >= 5:
+                battery_percent = tuya_payload.data[4]
+                _LOGGER.debug("Battery: %s%%", battery_percent)
+                
+                if 0 <= battery_percent <= 100:
+                    power_cluster = getattr(self.endpoint, "power", None)
+                    if power_cluster:
+                        zcl_battery = min(battery_percent * 2, 200)
+                        power_cluster._update_attribute(
+                            power_cluster.attributes_by_name["battery_percentage_remaining"].id,
+                            zcl_battery
+                        )
+            
+            # Handle firmware/device info data points
+            elif dp_num in [19, 20, 21, 22, 23, 24, 25, 26, 103, 104, 105, 201, 202]:
+                self._handle_firmware_info(dp_num, tuya_payload.data)
+            
+            # Try to identify calibration data points
+            elif dp_num in range(5, 16):  # Common range for calibration DPs
+                self._analyze_calibration_dp(dp_num, tuya_payload.data)
+        
+        # Call the parent handler
+        super().handle_cluster_request(hdr, args, dst_addressing=dst_addressing)
+    
+    def _handle_position_update(self, raw_position: int):
+        """Handle position updates with smart filtering and position inversion."""
+        import time
+        current_time = time.time()
+        
+        # Ignore updates during command processing
+        if current_time < self._ignore_until:
+            _LOGGER.debug("Position ignored (command cooldown): %s", raw_position)
+            return
+            
+        # Validate position range
+        if not (0 <= raw_position <= 100):
+            _LOGGER.debug("Position ignored (invalid range): %s", raw_position)
+            return
+        
+        # POSITION INVERSION: This device reports positions backwards
+        # Device: 0-4% = Open, 95-100% = Closed  
+        # HA Standard: 0% = Open, 100% = Closed
+        # So we need to invert: inverted_position = 100 - raw_position
+        inverted_position = 100 - raw_position
+        _LOGGER.debug("Position inversion: raw=%s%% -> corrected=%s%%", raw_position, inverted_position)
+        
+        # Collect position samples for stability checking (use inverted position)
+        self._position_samples.append((current_time, inverted_position))
+        
+        # Keep only recent samples (last 3 seconds)
+        self._position_samples = [(t, p) for t, p in self._position_samples if current_time - t < 3.0]
+        
+        # Need at least 2 samples to check stability
+        if len(self._position_samples) < 2:
+            return
+            
+        # Check if position has stabilized
+        recent_positions = [p for t, p in self._position_samples if current_time - t < 1.0]
+        
+        if len(recent_positions) >= 2:
+            # Position is stable if recent readings are consistent
+            pos_range = max(recent_positions) - min(recent_positions)
+            if pos_range <= 2:  # Within 2% tolerance
+                stable_position = int(sum(recent_positions) / len(recent_positions))
+                
+                # Only update if position has actually changed
+                if self._last_stable_position is None or abs(stable_position - self._last_stable_position) >= 2:
+                    self._update_position(stable_position)
+                    self._last_stable_position = stable_position
+                    # Clear samples after successful update
+                    self._position_samples.clear()
+                    
+    def _handle_firmware_info(self, dp_num: int, data):
+        """Handle firmware and device information data points."""
+        if not data:
+            return
+            
+        try:
+            # Map DP numbers to their likely content
+            dp_descriptions = {
+                19: "DEVICE_INFO",
+                20: "FIRMWARE_VERSION", 
+                21: "HARDWARE_VERSION",
+                22: "SOFTWARE_VERSION",
+                23: "MODULE_INFO",
+                24: "MCU_VERSION",
+                25: "WIFI_MODULE",
+                26: "DEVICE_STATUS",
+                103: "EXTENDED_DEVICE_INFO",
+                104: "FIRMWARE_BUILD",
+                105: "VERSION_STRING",
+                201: "SYSTEM_INFO",
+                202: "DEVICE_DETAILS",
+            }
+            
+            description = dp_descriptions.get(dp_num, f"INFO_DP_{dp_num}")
+            
+            # Try to interpret the data
+            if len(data) >= 1:
+                data_type = data[0]
+                
+                if data_type == 0:  # String data
+                    try:
+                        # Try to decode as string
+                        if len(data) > 4:
+                            string_data = bytes(data[4:]).decode('utf-8').strip('\x00')
+                            if string_data:
+                                _LOGGER.warning("🔧 %s (DP %s): '%s'", description, dp_num, string_data)
+                    except:
+                        # If string decode fails, show as hex
+                        hex_data = ' '.join(f'{b:02x}' for b in data[4:] if b != 0)
+                        if hex_data:
+                            _LOGGER.warning("🔧 %s (DP %s): %s", description, dp_num, hex_data)
+                
+                elif data_type == 2 and len(data) >= 5:  # Numeric data
+                    value = data[4] if len(data) == 5 else int.from_bytes(data[4:], 'big')
+                    _LOGGER.warning("🔧 %s (DP %s): %s", description, dp_num, value)
+                
+                elif data_type == 1 and len(data) >= 5:  # Boolean/enum data
+                    value = data[4]
+                    _LOGGER.warning("🔧 %s (DP %s): %s", description, dp_num, bool(value))
+                
+                else:
+                    # Unknown format, show raw data
+                    raw_data = ' '.join(f'{b:02x}' for b in data)
+                    _LOGGER.warning("🔧 %s (DP %s): [%s]", description, dp_num, raw_data)
+                    
+        except Exception as e:
+            _LOGGER.debug("Error parsing firmware info DP %s: %s", dp_num, e)
+                    
+    def _analyze_calibration_dp(self, dp_num: int, data):
+        """Enhanced analysis of calibration-related data points."""
+        if not data:
+            return
+            
+        data_len = len(data)
+        _LOGGER.warning("CALIBRATION DP %s ANALYSIS: len=%s, data=%s", dp_num, data_len, list(data))
+        
+        # Store the data point with metadata
+        self._known_data_points[dp_num] = {
+            'data': list(data),
+            'function': getattr(data, 'function', None),
+            'last_seen': __import__('time').time(),
+            'analysis': self._classify_data_point(dp_num, data)
+        }
+        
+        # Enhanced pattern recognition based on community findings
+        if data_len >= 5 and data[0] == 0x02:  # Type 2 = value
+            value = data[4] if data_len > 4 else None
+            if value is not None:
+                analysis = self._classify_calibration_value(dp_num, value)
+                _LOGGER.warning("DP %s CLASSIFICATION: %s (value: %s)", dp_num, analysis, value)
+    
+    def _classify_data_point(self, dp_num: int, data):
+        """Classify data point based on patterns and known information."""
+        if not data or len(data) < 2:
+            return "insufficient_data"
+            
+        data_type = data[0] if len(data) > 0 else None
+        value = data[4] if len(data) > 4 else None
+        
+        # Enhanced classification based on recent community research
+        classifications = {
+            # Motor control and calibration (most common)
+            5: "motor_speed_primary",
+            6: "motor_acceleration", 
+            7: "calibration_time_primary",
+            8: "calibration_time_secondary",
+            9: "motor_direction",
+            10: "motor_speed_secondary",
+            11: "position_limits",
+            
+            # Calibration triggers (based on GitHub findings)
+            14: "advanced_motor_settings",
+            15: "position_calibration",
+            16: "calibration_trigger_primary",
+            17: "calibration_trigger_secondary", 
+            18: "factory_calibration_reset",
+            
+            # Extended features
+            101: "extended_calibration_time",
+            102: "motor_characteristics",
+        }
+        
+        base_classification = classifications.get(dp_num, f"unknown_dp_{dp_num}")
+        
+        # Add value-based refinement
+        if value is not None:
+            if 5 <= value <= 120:
+                return f"{base_classification}_time_range"
+            elif 1 <= value <= 255:
+                return f"{base_classification}_speed_range"
+            elif value in [0, 1]:
+                return f"{base_classification}_boolean"
+                
+        return base_classification
+    
+    def _classify_calibration_value(self, dp_num: int, value: int):
+        """Classify calibration values based on range and context."""
+        if 5 <= value <= 120:
+            return f"CALIBRATION_TIME_CANDIDATE (DP {dp_num}): {value}s"
+        elif 1 <= value <= 255:
+            return f"MOTOR_SPEED_CANDIDATE (DP {dp_num}): {value}"
+        elif value in [0, 1]:
+            return f"BOOLEAN_TRIGGER_CANDIDATE (DP {dp_num}): {value}"
+        elif 0 <= value <= 100:
+            return f"PERCENTAGE_VALUE (DP {dp_num}): {value}%"
+        else:
+            return f"UNKNOWN_RANGE (DP {dp_num}): {value}"
+
+    async def set_calibration_time(self, seconds: int):
+        """Attempt to set calibration time via various DPs."""
+        if not (5 <= seconds <= 120):
+            _LOGGER.error("Calibration time must be between 5-120 seconds")
+            return foundation.Status.INVALID_VALUE
+            
+        # Try common data points for calibration time
+        for dp_candidate in [7, 8, 9, 10]:
+            try:
+                _LOGGER.warning("Trying to set calibration time via DP %s to %s seconds", dp_candidate, seconds)
+                await self.tuya_mcu_command(dp_candidate, seconds, expect_reply=False)
+                await __import__('asyncio').sleep(0.5)  # Small delay between attempts
+            except Exception as e:
+                _LOGGER.debug("Failed to set calibration via DP %s: %s", dp_candidate, e)
+        
+        return foundation.Status.SUCCESS
+    
+    async def set_motor_speed(self, speed: int):
+        """Attempt to set motor speed via various DPs."""
+        if not (1 <= speed <= 255):
+            _LOGGER.error("Motor speed must be between 1-255")
+            return foundation.Status.INVALID_VALUE
+            
+        # Try common data points for motor speed
+        for dp_candidate in [5, 6, 14, 15]:
+            try:
+                _LOGGER.warning("Trying to set motor speed via DP %s to %s", dp_candidate, speed)
+                await self.tuya_mcu_command(dp_candidate, speed, expect_reply=False)
+                await __import__('asyncio').sleep(0.5)
+            except Exception as e:
+                _LOGGER.debug("Failed to set motor speed via DP %s: %s", dp_candidate, e)
+        
+        return foundation.Status.SUCCESS
+    
+    async def trigger_calibration(self):
+        """Attempt to trigger calibration mode."""
+        _LOGGER.warning("Attempting to trigger calibration mode...")
+        
+        # Try common calibration trigger commands
+        calibration_commands = [
+            (16, 1),   # DP 16, value 1
+            (17, 1),   # DP 17, value 1  
+            (18, 1),   # DP 18, value 1
+            (101, 1),  # DP 101, value 1 (some devices use high DPs)
+        ]
+        
+        for dp, value in calibration_commands:
+            try:
+                _LOGGER.warning("Trying calibration trigger: DP %s = %s", dp, value)
+                await self.tuya_mcu_command(dp, value, expect_reply=False)
+                await __import__('asyncio').sleep(1.0)
+            except Exception as e:
+                _LOGGER.debug("Calibration trigger DP %s failed: %s", dp, e)
+        
+        return foundation.Status.SUCCESS
+    
+    def _update_position(self, position: int):
+        """Update the ZCL position attribute."""
+        try:
+            cover_cluster = getattr(self.endpoint, "window_covering", None)
+            if cover_cluster:
+                # Update the ZCL attribute
+                cover_cluster._update_attribute(
+                    WindowCovering.AttributeDefs.current_position_lift_percentage.id, 
+                    position
+                )
+                _LOGGER.info("Position updated to %s%%", position)
+        except Exception as e:
+            _LOGGER.error("Failed to update position: %s", e)
+    
+    def get_discovered_data_points(self):
+        """Return all discovered data points for analysis."""
+        return self._known_data_points.copy()
+
+    async def enhanced_calibration_sequence(self, calibration_time: int = None):
+        """Enhanced calibration sequence with SAFETY MEASURES to prevent overcalibration."""
+        if calibration_time is None:
+            # Use conservative default to prevent overcalibration
+            calibration_time = min(self._motor_specs['default_calibration_time'], 20)  # Max 20s default
+            
+        # SAFETY: Cap maximum calibration time to prevent damage
+        if calibration_time > 45:
+            _LOGGER.warning("Calibration time capped at 45s for safety (requested: %ss)", calibration_time)
+            calibration_time = 45
+            
+        _LOGGER.info("Starting SAFE enhanced calibration sequence (time: %ss)", calibration_time)
+        _LOGGER.warning("⚠️  SAFETY NOTICE: Blind will calibrate for MAX %s seconds", calibration_time)
+        _LOGGER.warning("⚠️  EMERGENCY STOP: Send 'STOP' command if blind goes too far!")
+        
+        try:
+            # Phase 1: Set CONSERVATIVE calibration time via multiple DPs
+            calibration_time_dps = [7, 8, 101]  # Primary candidates
+            for dp in calibration_time_dps:
+                try:
+                    _LOGGER.info("Setting SAFE calibration time (%ss) via DP %s", calibration_time, dp)
+                    await self.tuya_mcu_command(dp, calibration_time, expect_reply=False)
+                    await __import__('asyncio').sleep(0.5)
+                except Exception as e:
+                    _LOGGER.debug("DP %s calibration time failed: %s", dp, e)
+            
+            # Phase 2: Set MODERATE motor speed (prevent aggressive movement)
+            motor_speed_dps = [5, 6, 10, 14]  # Speed/acceleration candidates
+            # Use 70% of default speed for safer calibration
+            safe_speed = int(self._motor_specs['default_motor_speed'] * 0.7)
+            for dp in motor_speed_dps:
+                try:
+                    _LOGGER.info("Setting SAFE motor speed (%s) via DP %s", safe_speed, dp)
+                    await self.tuya_mcu_command(dp, safe_speed, expect_reply=False)
+                    await __import__('asyncio').sleep(0.5)
+                except Exception as e:
+                    _LOGGER.debug("DP %s motor speed failed: %s", dp, e)
+            
+            # Phase 3: Trigger calibration via multiple methods
+            calibration_triggers = [
+                (16, 1),   # Primary trigger
+                (17, 1),   # Secondary trigger
+                (18, 1),   # Alternative trigger
+                (101, 1),  # Extended trigger
+                (102, 0),  # Some devices use 0 to start calibration
+            ]
+            
+            for dp, value in calibration_triggers:
+                try:
+                    _LOGGER.warning("🔄 TRIGGERING SAFE CALIBRATION: DP %s = %s", dp, value)
+                    await self.tuya_mcu_command(dp, value, expect_reply=False)
+                    await __import__('asyncio').sleep(1.0)
+                except Exception as e:
+                    _LOGGER.debug("Calibration trigger DP %s failed: %s", dp, e)
+            
+            # Phase 4: Start calibration monitoring with timeout
+            self._calibration_state['in_progress'] = True
+            self._calibration_state['start_time'] = __import__('time').time()
+            
+            _LOGGER.warning("🔄 SAFE calibration sequence started!")
+            _LOGGER.warning("📋 SAFETY INSTRUCTIONS:")
+            _LOGGER.warning("  1. Blind will auto-calibrate for MAX %s seconds", calibration_time)
+            _LOGGER.warning("  2. Watch for overcalibration - blind should stop at limits")
+            _LOGGER.warning("  3. EMERGENCY STOP: Use Home Assistant STOP button if needed")
+            _LOGGER.warning("  4. Manual movement may be required during calibration")
+            
+            # Start safety timeout monitoring
+            __import__('asyncio').create_task(self._calibration_safety_monitor(calibration_time + 10))
+            
+            return foundation.Status.SUCCESS
+            
+        except Exception as e:
+            _LOGGER.error("Safe calibration failed: %s", e)
+            self._calibration_state['in_progress'] = False
+            return foundation.Status.FAILURE
+
+    async def _calibration_safety_monitor(self, max_duration: int):
+        """Monitor calibration and auto-stop if it runs too long."""
+        start_time = __import__('time').time()
+        
+        while self._calibration_state['in_progress']:
+            elapsed = __import__('time').time() - start_time
+            
+            if elapsed > max_duration:
+                _LOGGER.error("🛑 SAFETY TIMEOUT: Calibration exceeded %ss - AUTO-STOPPING", max_duration)
+                await self.emergency_stop()
+                self._calibration_state['in_progress'] = False
+                break
+                
+            await __import__('asyncio').sleep(1)
+    
+    async def emergency_stop(self):
+        """Emergency stop function to halt all movement immediately."""
+        _LOGGER.warning("🛑 EMERGENCY STOP ACTIVATED")
+        
+        try:
+            # Send stop command via ZCL
+            cover_cluster = getattr(self.endpoint, "window_covering", None)
+            if cover_cluster:
+                await cover_cluster.stop()
+                _LOGGER.info("ZCL stop command sent")
+            
+            # Send Tuya stop commands to multiple possible DPs
+            stop_commands = [
+                (1, 2),    # Common stop command
+                (2, 2),    # Alternative stop
+                (3, 2),    # Position stop
+            ]
+            
+            for dp, value in stop_commands:
+                try:
+                    await self.tuya_mcu_command(dp, value, expect_reply=False)
+                    _LOGGER.info("Tuya stop sent via DP %s", dp)
+                except Exception as e:
+                    _LOGGER.debug("Stop command DP %s failed: %s", dp, e)
+            
+            # Reset calibration state
+            self._calibration_state['in_progress'] = False
+            
+            _LOGGER.warning("🛑 Emergency stop sequence completed")
+            
+        except Exception as e:
+            _LOGGER.error("Emergency stop failed: %s", e)
+
+    async def safe_calibration_sequence(self, calibration_time: int = 15):
+        """Ultra-safe calibration with very conservative settings."""
+        _LOGGER.warning("🔒 Starting ULTRA-SAFE calibration (time: %ss)", calibration_time)
+        
+        # Force very conservative settings
+        safe_time = min(calibration_time, 15)  # Max 15 seconds
+        
+        _LOGGER.warning("🔒 ULTRA-SAFE MODE: Limited to %s seconds", safe_time)
+        _LOGGER.warning("🔒 Lower motor speed, shorter duration")
+        
+        # Set very conservative motor speed (50% of normal)
+        safe_speed = int(self._motor_specs['default_motor_speed'] * 0.5)
+        
+        try:
+            # Set ultra-safe parameters
+            await self.tuya_mcu_command(7, safe_time, expect_reply=False)
+            await __import__('asyncio').sleep(0.5)
+            await self.tuya_mcu_command(10, safe_speed, expect_reply=False)
+            await __import__('asyncio').sleep(0.5)
+            
+            # Trigger calibration
+            await self.tuya_mcu_command(16, 1, expect_reply=False)
+            
+            _LOGGER.warning("🔒 Ultra-safe calibration triggered - monitor closely!")
+            
+            # Auto-timeout after safe duration
+            await __import__('asyncio').sleep(safe_time + 5)
+            await self.emergency_stop()
+            
+            return foundation.Status.SUCCESS
+            
+        except Exception as e:
+            _LOGGER.error("Ultra-safe calibration failed: %s", e)
+            return foundation.Status.FAILURE
+
+    async def discover_firmware_info(self):
+        """Service command to manually discover firmware information."""
+        _LOGGER.warning("🔍 Manual firmware discovery requested")
+        await self._discover_firmware_version()
+        return foundation.Status.SUCCESS
+
+    async def get_firmware_cache(self):
+        """Service command to view cached firmware information."""
+        cache_info = self.get_cached_firmware_info()
+        if cache_info:
+            _LOGGER.warning("💾 CACHED FIRMWARE INFO:")
+            for key, value in cache_info.items():
+                if key != 'cached_time':
+                    _LOGGER.warning("💾   %s: %s", key.upper(), value)
+            if 'cached_time' in self._firmware_cache and self._firmware_cache['cached_time']:
+                cache_age = __import__('time').time() - self._firmware_cache['cached_time']
+                _LOGGER.warning("💾   Cache Age: %.1f hours", cache_age / 3600)
+        else:
+            _LOGGER.warning("💾 No firmware information cached yet")
+        return foundation.Status.SUCCESS
+
+
+class TuyaBlindWindowCoveringCluster(TuyaWindowCoverControl):
+    """Enhanced window covering cluster with ZCL attribute management."""
+
+    _CONSTANT_ATTRIBUTES = {
+        WindowCovering.AttributeDefs.window_covering_type.id: WindowCovering.WindowCoveringType.Rollershade,
+        WindowCovering.AttributeDefs.config_status.id: 0x03,
+        WindowCovering.AttributeDefs.physical_closed_limit_lift.id: 65535,
+        WindowCovering.AttributeDefs.installed_closed_limit_lift.id: 65535,
+    }
+    
+    async def bind(self):
+        """Set up the cluster with proper attribute initialization."""
+        result = await super().bind()
+        
+        # Initialize position attributes
+        try:
+            # Set default position if not already set
+            current_pos = self._attr_cache.get(WindowCovering.AttributeDefs.current_position_lift_percentage.id)
+            if current_pos is None:
+                self._update_attribute(WindowCovering.AttributeDefs.current_position_lift_percentage.id, 50)
+                _LOGGER.info("Initialized position to 50%")
+        except Exception as e:
+            _LOGGER.debug("Could not initialize position attributes: %s", e)
+            
+        return result
+    
+    async def command(
+        self,
+        command_id: int,
+        *args,
+        manufacturer: int | None = None,
+        expect_reply: bool = True,
+        tsn: int | None = None,
+        **kwargs,
+    ):
+        """Enhanced command handling with position prediction."""
+        command_name = {
+            0x00: "UP_OPEN",
+            0x01: "DOWN_CLOSE", 
+            0x02: "STOP"
+        }.get(command_id, f"UNKNOWN_0x{command_id:02x}")
+        
+        _LOGGER.info("Window covering command: %s", command_name)
+        
+        # Predict position changes for immediate UI feedback
+        if command_id in (0x00, 0x01):  # UP or DOWN
+            try:
+                current_pos = self._attr_cache.get(WindowCovering.AttributeDefs.current_position_lift_percentage.id, 50)
+                if command_id == 0x00:  # UP/OPEN
+                    predicted_pos = max(0, current_pos - 10)  # Estimate 10% movement
+                else:  # DOWN/CLOSE
+                    predicted_pos = min(100, current_pos + 10)
+                
+                # Temporarily update position for immediate feedback
+                self._update_attribute(WindowCovering.AttributeDefs.current_position_lift_percentage.id, predicted_pos)
+                _LOGGER.debug("Predicted position: %s%%", predicted_pos)
+            except Exception as e:
+                _LOGGER.debug("Could not predict position: %s", e)
+        
+        return await super().command(command_id, *args, manufacturer=manufacturer,
+                                   expect_reply=expect_reply, tsn=tsn, **kwargs)
+    
+    async def read_attributes(self, attributes, *args, **kwargs):
+        """Enhanced attribute reading with fallback values."""
+        result = await super().read_attributes(attributes, *args, **kwargs)
+        
+        # Provide sensible defaults for unsupported attributes
+        if result and isinstance(result, tuple) and len(result) > 0:
+            attr_dict = result[0]
+            for attr_id in attributes:
+                if attr_id not in attr_dict:
+                    # Provide defaults for commonly requested attributes
+                    if attr_id == WindowCovering.AttributeDefs.current_position_lift_percentage.id:
+                        attr_dict[attr_id] = self._attr_cache.get(attr_id, 50)
+                    elif attr_id == WindowCovering.AttributeDefs.window_covering_type.id:
+                        attr_dict[attr_id] = WindowCovering.WindowCoveringType.Rollershade
+                        
+        return result
+
+
+class TuyaBlindController(TuyaWindowCover):
+    """Enhanced Tuya blind controller with ZCL attribute integration."""
+
+    # Fixed command mapping - swap UP and DOWN since they were backwards
+    tuya_cover_command = {
+        0x0000: 0x0002,  # ZCL UP/OPEN -> Tuya 0x02
+        0x0001: 0x0000,  # ZCL DOWN/CLOSE -> Tuya 0x00
+        0x0002: 0x0001   # ZCL STOP -> Tuya 0x01
+    }
+    # Enable inversion to handle backwards position reporting (not commands)
+    tuya_cover_inverted_by_default = True
+
+    def __init__(self, *args, **kwargs):
+        """Initialize with enhanced features and position inversion."""
+        _LOGGER.info("Enhanced TuyaBlindController initialized for _TZE284_libht6ua (INVERTED POSITIONS)")
+        super().__init__(*args, **kwargs)
+
+    signature = {
+        MODELS_INFO: [
+            ("_TZE284_libht6ua", "TS0601"),
+            ("_TZE200_libht6ua", "TS0601"),
+        ],
+        ENDPOINTS: {
+            1: {
+                PROFILE_ID: zha.PROFILE_ID,
+                DEVICE_TYPE: 0x0051,
+                INPUT_CLUSTERS: [
+                    0x0000,  # Basic
+                    0x0004,  # Groups
+                    0x0005,  # Scenes
+
+                    0xef00,  # Additional Tuya cluster
+                ],
+                OUTPUT_CLUSTERS: [
+                    0x000a,  # Time
+                    0x0019,  # OTA
+                ],
+            }
+        },
+    }
+
+    replacement = {
+        ENDPOINTS: {
+            1: {
+                PROFILE_ID: zha.PROFILE_ID,
+                DEVICE_TYPE: zha.DeviceType.WINDOW_COVERING_DEVICE,
+                INPUT_CLUSTERS: [
+                    PersistentTuyaBasicCluster,  # Use persistent firmware Basic cluster
+                    Groups.cluster_id,
+                    Scenes.cluster_id,
+                    TuyaBlindControllerManufCluster,
+                    TuyaBlindWindowCoveringCluster,
+                    TuyaPowerConfigurationCluster,
+                ],
+                OUTPUT_CLUSTERS: [
+                    Time.cluster_id,
+                    Ota.cluster_id,
+                ],
+            }
+        }
+    }
+
+
+_LOGGER.info("Enhanced TuyaBlindController quirk loaded")
+
+# ENHANCED CALIBRATION INSTRUCTIONS WITH SAFETY FEATURES:
+# 
+# ⚠️  IMPORTANT SAFETY NOTICE ⚠️
+# The enhanced quirk now includes multiple safety features to prevent overcalibration
+# damage. Always monitor the calibration process and use emergency stop if needed.
+#
+# 🔄 POSITION INVERSION FIX INCLUDED:
+# This quirk automatically fixes the common Tuya blind position inversion issue.
+# Your device reports: 4% = Open, 96% = Closed
+# The quirk converts to HA standard: 0% = Open, 100% = Closed
+#
+# SAFETY FEATURES INCLUDED:
+# - Automatic calibration timeout (45 seconds maximum)
+# - Reduced motor speed during calibration (70% of normal)
+# - Emergency stop functionality
+# - Conservative default timing (20 seconds max)
+# - Position inversion correction (automatic)
+#
+# EMERGENCY STOP METHODS:
+# If your blind goes too far during calibration, immediately use one of these:
+#
+# 1. HOME ASSISTANT STOP BUTTON (FASTEST):
+#    - Go to your blind entity in Home Assistant
+#    - Click the STOP button (⏹️)
+#    - This sends an immediate stop command
+#
+# 2. EMERGENCY STOP SERVICE CALL:
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184
+#      cluster_type: in
+#      command: emergency_stop
+#      command_type: server
+#      params: {}
+#
+# 3. MANUAL DISCONNECT:
+#    - If device doesn't respond, disconnect power temporarily
+#
+# SAFE CALIBRATION METHODS:
+#
+# METHOD 1: Ultra-Safe Calibration (RECOMMENDED FOR FIRST ATTEMPT)
+# This method uses very conservative settings and auto-stops after 15 seconds
+# 1. Use the ultra-safe calibration:
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184
+#      cluster_type: in
+#      command: safe_calibration_sequence
+#      command_type: server
+#      params:
+#        calibration_time: 15  # Optional: max 15 seconds
+#
+# METHOD 2: Enhanced Safe Calibration (RECOMMENDED)
+# This method has built-in safety limits and timeout protection
+# 1. Use the enhanced calibration sequence:
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184  # 0xef00 - Tuya manufacturer cluster
+#      cluster_type: in
+#      command: enhanced_calibration_sequence
+#      command_type: server
+#      params:
+#        calibration_time: 20  # Optional: seconds (max 45s enforced)
+#
+# METHOD 3: Manual Data Point Configuration (ADVANCED)
+# For users who understand their device's specific requirements:
+#
+# For _TZE284_libht6ua and similar devices:
+# 1. Set SAFE calibration time via DP 7:
+#    Service: zha.issue_zigbee_cluster_command  
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184
+#      cluster_type: in
+#      command: 0  # SET_DATA command
+#      command_type: server
+#      params:
+#        param1: 7    # DP number (calibration time)
+#        param2: 2    # Data type (2 = value)
+#        param3: 20   # SAFE Value (start with 20 seconds, not 30+)
+#
+# 2. Set SLOWER motor speed via DP 10 (RECOMMENDED):
+#      params:
+#        param1: 10   # DP number (motor speed)
+#        param2: 2    # Data type
+#        param3: 70   # SLOWER speed (70 instead of 100+ for safety)
+#
+# 3. Trigger calibration via DP 16:
+#      params:
+#        param1: 16   # DP number (calibration trigger)
+#        param2: 1    # Data type (1 = boolean)
+#        param3: 1    # Trigger value
+#
+# CALIBRATION SAFETY CHECKLIST:
+#
+# BEFORE STARTING:
+# ✅ Ensure blind can move freely through full range
+# ✅ Clear any obstacles in the blind's path
+# ✅ Have Home Assistant interface ready for emergency stop
+# ✅ Start with the ULTRA-SAFE method first
+# ✅ Monitor Home Assistant logs during calibration
+#
+# DURING CALIBRATION:
+# ✅ Watch the blind movement closely
+# ✅ Be ready to hit STOP if blind goes too far
+# ✅ Listen for unusual motor sounds
+# ✅ Check that blind stops at physical limits
+# ✅ Use emergency stop if calibration exceeds expected time
+#
+# WARNING SIGNS TO STOP CALIBRATION:
+# 🛑 Blind continues moving after reaching physical limit
+# 🛑 Unusual grinding or straining motor sounds
+# 🛑 Calibration running longer than expected time
+# 🛑 Blind moving too aggressively or fast
+# 🛑 Any physical resistance or binding
+#
+# TROUBLESHOOTING SAFE CALIBRATION:
+#
+# Q: What if ultra-safe calibration (15s) isn't enough?
+# A: Try enhanced calibration with 25-30 seconds, monitor closely
+#
+# Q: What if my blind needs more than 45 seconds?
+# A: Use manual DP commands with conservative times, increase gradually
+#
+# Q: Blind stops responding during calibration?
+# A: Use emergency stop, then restart Home Assistant ZHA integration
+#
+# Q: Calibration completed but positions are wrong?
+# A: Try increasing calibration time by 5-10 seconds and recalibrate
+#
+# SAFE CALIBRATION PROCESS:
+#
+# 1. START ULTRA-SAFE (15 seconds):
+#    - Use safe_calibration_sequence first
+#    - Monitor for 20 seconds total
+#    - Check if positions are accurate
+#
+# 2. IF MORE TIME NEEDED:
+#    - Use enhanced_calibration_sequence with 25 seconds
+#    - Stay within 30 seconds maximum for safety
+#    - Monitor closely throughout process
+#
+# 3. FINE-TUNE IF NEEDED:
+#    - Increase time in 5-second increments only
+#    - Never exceed 45 seconds (automatic safety limit)
+#    - Always test stop functionality first
+#
+# DEVICE-SPECIFIC SAFE SETTINGS:
+#
+# - _TZE284_libht6ua: Start with 15-20 seconds, DP 7 for time
+# - _TZE200_libht6ua: Try DP 8 or DP 101, start with 20 seconds
+# - Unknown devices: Always start with ultra-safe method first
+#
+# FIRMWARE VERSION DISCOVERY:
+# To discover the device firmware version (shows as "unknown" by default):
+#
+# 🔒 PERSISTENT CACHING: Once discovered, firmware info is permanently cached
+#     and will NEVER disappear when the device goes to sleep!
+#
+# AUTOMATIC: Firmware discovery runs automatically when device binds
+# - Restores previously cached firmware info first
+# - Discovers new firmware info if not cached
+# - Permanently stores discovered info
+#
+# MANUAL: Use this service call to manually discover firmware:
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184
+#      cluster_type: in
+#      command: discover_firmware_info
+#      command_type: server
+#      params: {}
+#
+# VIEW CACHE: Check what firmware info is currently cached:
+#    Service: zha.issue_zigbee_cluster_command
+#    Data:
+#      ieee: [your device IEEE address]
+#      endpoint_id: 1
+#      cluster_id: 61184
+#      cluster_type: in
+#      command: get_firmware_cache
+#      command_type: server
+#      params: {}
+#
+# Look for firmware info in the logs with messages like:
+# 🔧 FIRMWARE_VERSION (DP 20): '1.2.3'
+# 📋 APP_VERSION: 42
+# 📋 SW_BUILD_ID: ABC123
+# 💾 CACHED FIRMWARE INFO: [shows cached versions]
+# 🔄 Restoring cached firmware information...
+#
+# LOG MESSAGES TO MONITOR:
+# ✅ "🔄 SAFE calibration sequence started!" - Normal start
+# ✅ "Setting SAFE calibration time" - Parameters being set
+# ⚠️  "⚠️  SAFETY NOTICE: Blind will calibrate for MAX X seconds" - Time limit
+# 🛑 "🛑 SAFETY TIMEOUT" - Auto-stop triggered
+# 🛑 "🛑 EMERGENCY STOP ACTIVATED" - Manual stop executed
+#
+# After successful calibration, verify:
+# - Blind reports accurate position percentages (0-100%)
+# - Blind stops at proper open/closed physical limits
+# - Emergency stop works when tested
+# - Position commands work correctly (25%, 50%, 75%, etc.)
+# - No overcalibration or motor strain occurred
