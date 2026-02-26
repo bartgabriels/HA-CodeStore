@@ -877,8 +877,8 @@ class TuyaBlindController(TuyaWindowCover):
 
     # Fixed command mapping - swap UP and DOWN since they were backwards
     tuya_cover_command = {
-        0x0000: 0x0002,  # ZCL UP/OPEN -> Tuya 0x02
-        0x0001: 0x0000,  # ZCL DOWN/CLOSE -> Tuya 0x00
+        0x0000: 0x0000,  # ZCL UP/OPEN -> Tuya 0x00
+        0x0001: 0x0002,  # ZCL DOWN/CLOSE -> Tuya 0x02
         0x0002: 0x0001   # ZCL STOP -> Tuya 0x01
     }
     # Enable inversion to handle backwards position reporting (not commands)
